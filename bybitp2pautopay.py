@@ -28,6 +28,7 @@ import pytz
 from decimal import Decimal, ROUND_DOWN
 import uuid
 from openai import OpenAI
+from telegram_runner import TelegramBot
 
 
 
@@ -42,6 +43,7 @@ load_dotenv()
 
 import re
 import unicodedata
+
 
 BRANCH_NOISE = {
     "branch", "br.", "br", "office", "market", "shop", "road", "rd", "street",
@@ -262,6 +264,9 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 # IMPORTANT: Bybit P2P API does NOT use /v5/ prefix in its base path
 BYBIT_BASE_URL = os.getenv('BYBIT_BASE_URL', "https://api.bybit.com") # Default to production if not set
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 # Paystack API Credentials
 PAYSTACK_SECRET_KEY = os.getenv('PAYSTACK_SECRET_KEY')
 PAYSTACK_BASE_URL = "https://api.paystack.co"
@@ -272,6 +277,7 @@ NOMBA_CLIENT_SECRET = os.getenv('NOMBA_CLIENT_SECRET')
 NOMBA_ACCOUNT_ID = os.getenv('NOMBA_ACCOUNT_ID') # Your Business ID from Nomba dashboard
 NOMBA_BASE_URL = os.getenv('NOMBA_BASE_URL') # e.g., https://sandbox.nomba.com or https://api.nomba.com
 NOMBA_SENDER_NAME = os.getenv('NOMBA_SENDER_NAME') # NEW: sender name
+NOMBA_SUB_ACCOUNT_ID = os.getenv('NOMBA_SUB_ACCOUNT_ID', '')
 
 # Redis Configuration
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
@@ -284,6 +290,8 @@ REDIS_DB = int(os.getenv('REDIS_DB', 2))
 POLLING_INTERVAL_SECONDS = int(os.getenv('POLLING_INTERVAL_SECONDS', 5))
 MAX_ORDERS_PER_CYCLE = int(os.getenv('MAX_ORDERS_PER_CYCLE', 100))
 APPROVAL_MODE_ENABLED_DEFAULT = False
+
+
 
 # Wallet lookup fallback settings
 WALLET_NO_LOOKUP_MAX = 500000  # Maximum amount allowed for wallet fallback (adjust as needed)
@@ -416,6 +424,9 @@ class BybitP2PClient:
                     
                     # Fetch full payment details for the dashboard display
                     payment_info = self.get_order_details(order_id)
+
+                    result = payment_info.get("result", {}) if payment_info else {}
+
                     
                     # --- Mapping Bybit API keys to frontend expected keys ---
                     seller_info = {
@@ -441,11 +452,13 @@ class BybitP2PClient:
                         status_str = str(status_raw)
 
                     orders.append({
-                        'orderId': order_id,
-                        'fiatAmount': float(order.get('amount', 0.0)), # Correctly using 'amount'
-                        'sellerInfo': seller_info, # Now populating with actual details or N/A if fetch failed
-                        'status': status_str,
-                        'createdAt': order.get('createDate', order.get('createdTime', 'N/A')),
+                        'orderId':    order_id,
+                        'fiatAmount': float(order.get('amount', 0.0)),
+                        'usdtAmount': float(order.get('quantity') or order.get('notifyTokenQuantity') or 0.0),
+                        'unitPrice':  float(order.get('price') or order.get('unitPrice') or 0.0),
+                        'sellerInfo': seller_info,
+                        'status':     status_str,
+                        'createdAt':  order.get('createDate', order.get('createdTime', 'N/A')),
                     })
                 logger.info(f"Found {len(orders)} pending Bybit orders (with payment details) for dashboard.")
                 return orders
@@ -641,6 +654,8 @@ class NombaAPI:
 
         try:
             response = requests.request(method, url, headers=headers, json=data, timeout=300)
+            if response.status_code == 201:
+                return response.json()  # treat as pending, do not raise
             response.raise_for_status()
             return response.json()
         except requests.exceptions.Timeout:
@@ -666,7 +681,13 @@ class NombaAPI:
         return self._send_request('POST', endpoint, data)
 
     def initiate_fund_transfer(self, amount, account_number, account_name, bank_code, merchant_tx_ref, narration=None):
-        endpoint = "/v1/transfers/bank"
+        use_sub = redis_client.get('p2p_bot:use_sub_account')
+        sub_account_id = redis_client.get('p2p_bot:sub_account_id') or os.getenv('NOMBA_SUB_ACCOUNT_ID', '')
+
+        if use_sub == 'true' and sub_account_id:
+            endpoint = f"/v2/transfers/bank/{sub_account_id}"
+        else:
+            endpoint = "/v1/transfers/bank"
         data = {
             "amount": amount,
             "accountNumber": account_number,
@@ -716,6 +737,84 @@ class NombaAPI:
         except Exception as e:
             logger.error(f"Failed to retrieve Nomba wallet balance: {e}. Defaulting to 0.")
             return 0.0
+    def get_sub_account_balance(self, sub_account_id: str) -> float:
+        """
+        Fetch balance for a specific Nomba sub-account.
+        Endpoint: GET /v1/accounts/{subAccountId}/balance
+        Header: accountId = parent business account ID
+        """
+        if not self._authenticate():
+            logger.error("Failed to authenticate before fetching sub-account balance.")
+            return 0.0
+
+        url = f"{self.base_url}/v1/accounts/{sub_account_id}/balance"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "accountId": self.account_id  # parent account ID
+        }
+
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            logger.info(f"Nomba sub-account balance response ({sub_account_id}): {data}")
+
+            if data.get("code") == "00":
+                balance = float(data.get('data', {}).get('amount', 0.0))
+                logger.info(f"Nomba sub-account ({sub_account_id}) balance: {balance} NGN")
+                return balance
+            else:
+                logger.error(f"Failed to fetch sub-account balance: {data.get('description')}")
+                return 0.0
+
+        except Exception as e:
+            logger.error(f"Failed to retrieve sub-account balance ({sub_account_id}): {e}. Defaulting to 0.")
+            return 0.0
+
+    def get_sub_account_details(self, sub_account_id: str = None, account_ref: str = None) -> dict:
+        """
+        Fetch details for a Nomba sub-account.
+        Endpoint: GET /v1/accounts/sub-account-details?accountId=<sub_account_id>
+        Header:   accountId = parent business account ID (not the sub-account)
+        """
+        if not sub_account_id and not account_ref:
+            logger.error("get_sub_account_details: must supply sub_account_id or account_ref")
+            return {}
+
+        if not self._authenticate():
+            logger.error("Failed to authenticate before fetching sub-account details.")
+            return {}
+
+        params = {}
+        if sub_account_id:
+            params["accountId"] = sub_account_id
+        if account_ref:
+            params["accountRef"] = account_ref
+
+        url = f"{self.base_url}/v1/accounts/sub-account-details"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "accountId": self.account_id  # parent business account ID
+        }
+
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            logger.info(f"Nomba sub-account details response ({sub_account_id or account_ref}): {data}")
+
+            if data.get("code") == "00":
+                return data.get("data", {})
+            else:
+                logger.error(f"Failed to fetch sub-account details: {data.get('description')}")
+                return {}
+
+        except Exception as e:
+            logger.error(f"Failed to retrieve sub-account details ({sub_account_id or account_ref}): {e}")
+            return {}
+
     # --- Function to fetch Nomba bank codes dynamically ---
     def check_transfer_status(self, merchant_tx_ref):
         url = f"https://api.nomba.com/v1/transactions/requery/{merchant_tx_ref}"
@@ -793,63 +892,56 @@ class P2PBotService:
         return v if v not in (None, '') else default
     
     def _handle_transfer_failure(self, order_id, message, log_level='error'):
-        """Log, classify, clear in-progress flags, persist details, and notify via Telegram."""
+     # ✅ MARK AS FAILED (THIS IS THE FIX)
+     if self.redis_client:
+        self.redis_client.sadd("p2p_bot:failed_orders", order_id)
+        self.redis_client.srem("p2p_bot:pending_transfers", order_id)
 
-    # 1) Clear any 'in-progress' state so future cycles can try again
-        try:
-          if self.redis_client:
-            # remove from pending set
-            self.redis_client.srem("p2p_bot:pending_transfers", order_id)
-
-            # get and clear nomba refs (both directions)
+    # --- CLEAN UP PENDING STATE ---
+     try:
+        if self.redis_client:
             ref = self.redis_client.hget("p2p_bot:pending_nomba_refs", order_id)
             self.redis_client.hdel("p2p_bot:pending_nomba_refs", order_id)
+
             if ref:
                 self.redis_client.hdel("p2p_bot:nomba_tx_ref_to_order", ref)
-        except Exception as e:
-          logger.error(f"Failed to clear pending flags for {order_id}: {e}")
 
-    # 2) Log with appropriate level (keep your behavior)
-        if log_level == 'critical':
-         logger.critical(message)
-        elif log_level == 'warning':
-         logger.warning(message)
-        elif log_level == 'info':
-         logger.info(message)
-        else:
-         logger.error(message)
+     except Exception as e:
+        logger.error(f"Cleanup failed: {e}")
 
-    # 3) Classify failure (keep your behavior)
-        msg_low = (message or "").lower()
-        if any(w in msg_low for w in ["insufficient", "low balance", "balance too low"]):
-         if self.redis_client:
-            self.redis_client.sadd("p2p_bot:insufficient_funds_orders", order_id)
-        else:
-         if self.redis_client:
-            self.redis_client.sadd("p2p_bot:stuck_orders", order_id)
+    # --- LOG ERROR ---
+     if log_level == "critical":
+        logger.critical(message)
+     elif log_level == "warning":
+        logger.warning(message)
+     elif log_level == "info":
+        logger.info(message)
+     else:
+        logger.error(message)
 
-    # 4) Build order details from Redis (keep your behavior)
-        try:
-            order_details = {
-                'order_id': order_id,
-                'reason': message,
-                'amount': self._rget(f'p2p_bot:order_details:{order_id}', 'amount'),
-                'seller_bank_name': self._rget(f'p2p_bot:order_details:{order_id}', 'bank'),
-                'seller_account_no': self._rget(f'p2p_bot:order_details:{order_id}', 'account'),
-                'seller_real_name': self._rget(f'p2p_bot:order_details:{order_id}', 'name'),
+    # --- BUILD ORDER DETAILS FOR TELEGRAM ---
+     try:
+        order_details = {
+            "order_id": order_id,
+            "reason": message,
+            "amount": self._rget(f"p2p_bot:order_details:{order_id}", "amount"),
+            "seller_bank_name": self._rget(f"p2p_bot:order_details:{order_id}", "bank"),
+            "seller_account_no": self._rget(f"p2p_bot:order_details:{order_id}", "account"),
+            "seller_real_name": self._rget(f"p2p_bot:order_details:{order_id}", "name"),
         }
-        except Exception:
-            order_details = {'order_id': order_id, 'reason': message}
+     except Exception:
+        order_details = {"order_id": order_id, "reason": message}
 
-    # 5) Notify Telegram with your editable template (keep your behavior)
-        tg = getattr(self, "telegram_bot", None)
-        if tg:
-            try:
-                _safe_fire_and_forget(
-                    tg.send_stuck_order_notification(order_id, message, order_details)
+    # --- SEND TELEGRAM ALERT ---
+     try:
+        if self.telegram_bot:
+            _safe_fire_and_forget(
+                self.telegram_bot.send_stuck_order_notification(
+                    order_id, message, order_details
                 )
-            except Exception as e:
-                logger.error(f"Failed to schedule Telegram notify for {order_id}: {e}")
+            )
+     except Exception as e:
+        logger.error(f"Telegram notification failed: {e}")
     def _get_clean_bank(self, raw_input):
         if not raw_input:
             return ""
@@ -859,160 +951,292 @@ class P2PBotService:
         for word in noise:
             clean = clean.replace(word, " ")
         return clean.strip()
+    def _resolve_bank_name_field(self, order_details: dict, term: dict) -> str:
+     candidates = [
+        term.get('bankName'),
+        term.get('branchName'),
+        term.get('remark'),
+        term.get('paymentExt1'),
+        term.get('paymentExt2'),
+        order_details.get('bankName'),
+    ]
+
+     def _norm(s):
+        return "".join(s.lower().split())
+
+     def _clean(s):
+        """Strip branch noise so 'GTBank Ikeja Branch Lagos' → 'gtbank'"""
+        noise = [
+            "branch", "plc", "limited", "ltd", "nigeria", "lagos",
+            "abuja", "ikeja", "island", "victoria", "surulere", "lekki",
+            "mainland", "ph", "port harcourt", "ibadan", "kano", "office",
+            "mfb", "microfinance", "paymentservice", "psb", "-", ","
+        ]
+        s = s.lower()
+        for word in noise:
+            s = s.replace(word, " ")
+        return "".join(s.split())  # collapse spaces
+
+     norm_keys = {_norm(k): k for k in BANK_CODES.keys()}
+
+     for candidate in candidates:
+        val = (candidate or '').strip()
+        if not val:
+            continue
+
+        # ── Step 1: exact/substring match on raw value ───────
+        normalized = val.lower()
+        for key in BANK_CODES.keys():
+            if key in normalized or normalized in key:
+                logger.info(f"Resolved bank '{val}' → '{key}' (substring)")
+                return val
+
+        # ── Step 2: substring match on CLEANED value ─────────
+        cleaned = _clean(val)
+        for key in BANK_CODES.keys():
+            key_clean = _clean(key)
+            if key_clean and (key_clean in cleaned or cleaned in key_clean):
+                logger.info(f"Resolved bank '{val}' → '{key}' (cleaned substring)")
+                return val
+
+        # ── Step 3: fuzzy match on cleaned value ─────────────
+        best = process.extractOne(cleaned, list(norm_keys.keys()), scorer=fuzz.token_set_ratio)
+        if best and best[1] >= 80:  # threshold can be adjusted
+            matched_key = norm_keys[best[0]]
+            logger.info(f"Fuzzy matched bank '{val}' → '{matched_key}' (score={best[1]})")
+            return val
+
+     logger.warning(f"Could not resolve bank name from candidates: {candidates}")
+     return ""
 
     def _extract_payment_details(self, order_details, order_id):
-        payment_terms = order_details.get('paymentTermList') or []
-        if not payment_terms:
-            self._handle_transfer_failure(order_id, "No payment terms found", log_level="warning")
-            return None, None, None
+     payment_terms = order_details.get('paymentTermList') or []
+     if not payment_terms:
+        self._handle_transfer_failure(order_id, "No payment terms found", log_level="warning")
+        return None, None, None
 
-        # Prefer Bank Transfer (Type 14) or fallback to first available
-        term = next((t for t in payment_terms if str(t.get('paymentType')) == '14'), payment_terms[0])
+    # Prefer Bank Transfer
+     term = next(
+        (t for t in payment_terms if str(t.get('paymentType')) == '14'),
+        payment_terms[0]
+    )
 
-        known_banks = [
-            "uba", "access", "firstbank", "gtbank", "guarantytrust", "zenith", "kuda", "opay", "unitedbankofafrica",
-            "palmpay", "moniepoint", "stanbic", "wema", "fidelity", "fcmb", "9japay", "jaizbank",
-            "union", "sterling", "ecobanknigeria", "9psb", "fairmoney", "providus","paga",
-            "diamond", "keystone", "polaris", "paycom(opay)", "standbicibtc", "rubies", "sparkle", "vfd", "kekabank"
-        ]
+    # ── BANK NAME ──────────────────────────────────────────────
+     seller_bank_name = self._resolve_bank_name_field(order_details, term)
 
-        # --- 1. FIND THE 10-DIGIT ACCOUNT NUMBER ---
-        seller_account_no = ""
-        acct_field_used = ""
+    # ── ACCOUNT NUMBER ─────────────────────────────────────────
+     account_candidates = [
+        term.get('accountNo'),
+        term.get('paymentExt2'),
+        term.get('paymentExt1'),
+        term.get('paymentExt3'),
+        term.get('debitCardNumber'),
+        term.get('mobile'),
+    ]
 
-        val = normalize_account_number(term.get('accountNo', ''))
-        if len(val) == 10:
-            seller_account_no = val
-            acct_field_used = 'accountNo'
-        else:
-            for field in ['debitCardNumber', 'branchName', 'bankName']:
-                val = normalize_account_number(term.get(field, ''))
-                if len(val) == 10:
-                    seller_account_no = val
-                    acct_field_used = field
-                    break
+     seller_account_no = ''
+     for val in account_candidates:
+        raw = str(val or '')
 
-        # --- 2. FIND THE BANK NAME (HIERARCHICAL SEARCH) ---
-        seller_bank_name = ""
-        
-        # Priority A: Check the 'bankName' field first
-        bank_raw = term.get('bankName', '')
-        bank_clean = self._get_clean_bank(bank_raw)
-        
-        for bank in known_banks:
-            if bank in bank_clean:
-                seller_bank_name = bank
-                break
+        # 🔥 extract digits from anything
+        digits = ''.join(filter(str.isdigit, raw))
 
-        # Priority B: If Bank Name was empty/garbage (like "APP"), check 'branchName'
-        if not seller_bank_name:
-            branch_raw = term.get('branchName', '')
-            branch_clean = self._get_clean_bank(branch_raw)
-            for bank in known_banks:
-                if bank in branch_clean:
-                    seller_bank_name = bank
-                    break
-        else:
-            branch_clean = "" # Initialize for the fuzzy logic below if bank was found
+        if not digits:
+            continue
 
-        # Priority C: Last Resort - Fuzzy Match (handles typos like "Kudda")
-        if not seller_bank_name:
-            import difflib
-            # Use whichever field actually had text in it
-            best_input = bank_clean if bank_clean else (branch_clean if 'branch_clean' in locals() else "")
-            if best_input:
-                matches = difflib.get_close_matches(best_input, known_banks, n=1, cutoff=0.7)
-                if matches:
-                    seller_bank_name = matches[0]
+        # normalize 11 → 10
+        if len(digits) == 11 and digits.startswith('0'):
+            digits = digits[1:]
 
-        # --- 3. FIND THE REAL NAME ---
-        seller_real_name = (term.get('realName') or order_details.get('sellerRealName') or '').strip()
+        if len(digits) == 10:
+            seller_account_no = digits
+            break
 
-        # Final Validation
-        if not (seller_account_no and seller_bank_name and seller_real_name):
-            # --- AI FALLBACK INITIATED ---
-            print(f"Standard extraction failed for Order {order_id}. Consulting AI...")
-            
-            ai_data = self._ai_extraction_fallback(term, known_banks)
-            
-            if ai_data:
-                seller_bank_name = seller_bank_name or ai_data.get('bank')
-                seller_account_no = seller_account_no or ai_data.get('account_number')
-                seller_real_name = seller_real_name or ai_data.get('name')
+    # ── REAL NAME ──────────────────────────────────────────────
+     seller_real_name = (
+        order_details.get('sellerRealName') or
+        term.get('realName') or ''
+    ).strip()
 
-        # Final Check after AI intervention
-        if not (seller_account_no and seller_bank_name and seller_real_name):
-            error_msg = f"Incomplete details. Acct: {seller_account_no}, Bank: {seller_bank_name}, Name: {seller_real_name}"
-            self._handle_transfer_failure(order_id, error_msg, log_level="warning")
-            return None, None, None
-        
-        return seller_bank_name, seller_account_no, seller_real_name
-
-    
-    def _ai_extraction_fallback(self, raw_term_data, known_banks):
-        """
-        Uses Groq LLM to intelligently map messy or misspelled data 
-        to your existing list of known banks.
-        """
-        client = OpenAI(
-            api_key=os.environ.get("GROQ_API_KEY"),
-            base_url="https://api.groq.com/openai/v1",
+     # ── FINAL CHECK ────────────────────────────────────────────
+     if not (seller_bank_name and seller_account_no and seller_real_name):
+        self._handle_transfer_failure(
+            order_id,
+            "Missing bank details after fallback",
+            log_level="warning"
         )
-        
-        # Convert your list to a string for the AI to read
-        valid_banks_str = ", ".join(known_banks)
+        return None, None, None
 
-        prompt = f"""
-        You are a financial data parser. A user has provided messy payment details.
-        
-        YOUR GOAL:
-        Extract the bank name, 10-digit account number, and account holder name.
-        
-        REFERENCE LIST OF VALID BANKS:
-        {valid_banks_str}
-        
-        HUMAN-LIKE REASONING RULES:
-        1. If the bank name is misspelled (e.g., 'Kudda' or 'Opai'), map it to the closest match in the REFERENCE LIST.
-        2. If the fields are swapped (e.g., the account number is in the 'bankName' field), identify the 10-digit string and label it 'account_number'.
-        3. If multiple banks are mentioned, pick the one that looks like the primary destination.
-        4. Ignore 'APP' or garbage text.
+     return seller_bank_name, seller_account_no, seller_real_name 
+    
+    def check_pending_nomba_transfers(self):
+     orders = self.redis_client.smembers("p2p_bot:pending_transfers")
 
-        INPUT DATA:
-        {raw_term_data}
-        
-        RETURN ONLY JSON:
-        {{"bank": "match_from_list", "account_number": "10_digits", "name": "extracted_name"}}
-        """
-        
+     for order_id in orders:
         try:
-            response = client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "You are a precise data extraction tool. Only output valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                model="llama-3.3-70b-versatile",
-                response_format={"type": "json_object"},
-                temperature=0.1
-            )
-            return json.loads(response.choices[0].message.content)
+            ref = self.redis_client.hget("p2p_bot:pending_nomba_refs", order_id)
+
+            if not ref:
+                logger.warning(f"⚠️ No Nomba ref for {order_id}")
+                continue
+
+            status = self.nomba_api.check_transfer_status(ref)
+
+            code = status.get("code")
+            flag = status.get("data", {}).get("status", "").upper()
+            desc = status.get("description", "").lower()
+
+            logger.info(f"🔍 Nomba status for {order_id}: code={code}, flag={flag}")
+
+            # ✅ ALWAYS try confirm (CRITICAL FIX)
+            self._force_confirm_bybit(order_id)
+
+            # ❌ ONLY remove if transfer truly failed
+            if "fail" in desc:
+                logger.error(f"❌ Nomba failed for {order_id}: {status}")
+
+                # mark failed properly
+                self.redis_client.sadd("p2p_bot:failed_orders", order_id)
+
+                # remove from pending (no point retrying)
+                self.redis_client.srem("p2p_bot:pending_transfers", order_id)
+
         except Exception as e:
-            # AI fallback failed
-            logger.error(f"AI extraction failed: {e}")
-            return None
-            return None
+            logger.error(f"💥 Error checking Nomba for {order_id}: {e}")
+    def _force_confirm_bybit(self, order_id):
+     """
+     Force-confirm a Bybit P2P order after transfer.
+     ONLY marks processed when Bybit status == PAID.
+     Safe for retries.
+     """
+
+     try:
+        logger.info(f"🔁 Force-confirm attempt for {order_id}")
+
+        # 🔒 Skip failed
+        if self.redis_client.sismember("p2p_bot:failed_orders", order_id):
+            logger.warning(f"⛔ Skipping failed order {order_id}")
+            return
+
+        # 🔒 Must be pending
+        if not self.redis_client.sismember("p2p_bot:pending_transfers", order_id):
+            logger.warning(f"⚠️ {order_id} not in pending_transfers")
+            return
+
+        # --- 1. GET ORDER ---
+        details = self.bybit_api.get_order_details(order_id)
+        if not details:
+            logger.warning(f"⚠️ No response for {order_id}")
+            return
+
+        if details.get("ret_code", details.get("retCode")) != 0:
+            logger.warning(f"⚠️ Bad response for {order_id}")
+            return
+
+        result = details.get("result", {})
+        status = result.get("status")
+
+        # --- 2. TRUST ONLY STATUS ---
+        if status in [1, 2]:
+            logger.info(f"✅ Already PAID on Bybit {order_id}")
+
+            self.redis_client.srem("p2p_bot:pending_transfers", order_id)
+            self.redis_client.sadd("p2p_bot:processed_orders", order_id)
+            self.redis_client.hdel("p2p_bot:confirm_retry_count", order_id)
+            return
+
+        # --- 3. GET PAYMENT TERM ---
+        account = self._rget(f"p2p_bot:order_details:{order_id}", "account")
+
+        payment_type, payment_id, reason = self._pick_bybit_payment_term(
+            result,
+            account
+        )
+
+        if not payment_type or not payment_id:
+            logger.error(f"❌ No payment term for {order_id} ({reason})")
+            return  # stay pending → retry next cycle
+
+        logger.info(f"🔍 paymentType={payment_type}, paymentId={payment_id}")
+
+        # --- 4. TRY CONFIRM ---
+        for i in range(3):  # keep small, scheduler handles long retries
+            try:
+                resp = self.bybit_api.confirm_p2p_order_paid(
+                    order_id,
+                    payment_type,
+                    payment_id
+                )
+
+                ret = resp.get("retCode", resp.get("ret_code"))
+                msg = resp.get("retMsg", resp.get("ret_msg", ""))
+
+                if ret == 0:
+                    logger.info(f"📨 Confirm accepted for {order_id}")
+
+                    # 🔥 WAIT FOR BYBIT TO UPDATE
+                    time.sleep(3)
+
+                    verify = self.bybit_api.get_order_details(order_id)
+                    verify_status = verify.get("result", {}).get("status")
+
+                    if verify_status in [1, 2]:
+                        logger.info(f"✅ VERIFIED PAID {order_id}")
+
+                        self.redis_client.srem("p2p_bot:pending_transfers", order_id)
+                        self.redis_client.sadd("p2p_bot:processed_orders", order_id)
+                        self.redis_client.hdel("p2p_bot:confirm_retry_count", order_id)
+                        return
+
+                    else:
+                        logger.warning(f"⚠️ Not updated yet {order_id} (status={verify_status})")
+                        return  # retry next scheduler cycle
+
+                else:
+                    logger.warning(f"⚠️ Confirm rejected {order_id}: {msg}")
+
+            except Exception as e:
+                logger.error(f"❌ Confirm error {order_id}: {e}")
+
+            # --- GLOBAL RETRY TRACK ---
+            count = self.redis_client.hincrby(
+                "p2p_bot:confirm_retry_count",
+                order_id,
+                1
+            )
+
+            if count > 20:
+                logger.critical(f"🚨 Stuck order {order_id}")
+
+                try:
+                    if self.telegram_bot:
+                        self.telegram_bot.send_message(
+                            chat_id=self.chat_id,
+                            text=f"⚠️ Order {order_id} stuck after payment"
+                        )
+                except Exception as e:
+                    logger.error(f"Telegram error: {e}")
+
+                return
+
+            time.sleep(2)
+
+        logger.warning(f"⚠️ Retry loop done for {order_id}")
+
+     except Exception as e:
+        logger.error(f"💥 Fatal confirm error {order_id}: {e}")
 
     def _store_order_details(self, order_id, amount, bank_name, account_no, real_name):
-        """Store order details in Redis for later use in notifications"""
-        if not self.redis_client:
-            return
-        self.redis_client.hset(f'p2p_bot:order_details:{order_id}', mapping={
-            'account': normalize_account_number(account_no),
-            'bank': bank_name or '',
-            'account': str(account_no or ''),
-            'name': real_name or '',
-            'timestamp': str(time.time()),
-        })
-        self.redis_client.expire(f'p2p_bot:order_details:{order_id}', 86400)
+     if not self.redis_client:
+        return
+     self.redis_client.hset(f'p2p_bot:order_details:{order_id}', mapping={
+        'amount': str(amount or 0),       # ← was missing entirely
+        'bank': bank_name or '',
+        'account': normalize_account_number(str(account_no or '')),
+        'name': real_name or '',
+        'timestamp': str(time.time()),
+    })
+     self.redis_client.expire(f'p2p_bot:order_details:{order_id}', 86400)
         
     def set_approval_mode(self, enabled):
         self.use_approval_mode = enabled
@@ -1104,7 +1328,9 @@ class P2PBotService:
             "scheduler_active": scheduler_active,
             "last_cycle": float(last_cycle_time) if last_cycle_time else None,
             "use_approval_mode": self.use_approval_mode,
-            "use_nomba_for_transfers": USE_NOMBA_FOR_TRANSFERS
+            "use_nomba_for_transfers": USE_NOMBA_FOR_TRANSFERS,
+            "use_sub_account": redis_client.get('p2p_bot:use_sub_account') == 'true' if redis_client else False,
+            "active_sub_account_id": redis_client.get('p2p_bot:sub_account_id') or NOMBA_SUB_ACCOUNT_ID or None,
         }
 
     def get_pending_orders_data(self):
@@ -1209,20 +1435,29 @@ class P2PBotService:
             logger.warning(f"⚠️ Failed to send chat for {order_id}: {resp}")
 
     def _execute_transfer(self, order_id, amount_naira, seller_bank_name, seller_account_no, seller_real_name):
+     
      """Unified function to execute transfers via selected gateway."""
 
      lock_key = f"p2p_bot:lock:{order_id}"
+     locked = self.redis_client.set(lock_key, "1", nx=True, ex=180)
+     if not locked:
+      logger.warning(f"⛔ Order {order_id} is already being processed. Skipping duplicate execution.")
+      return False
+     try:
+        # Store order details FIRST (before any early returns)
+       self._store_order_details(order_id, amount_naira, seller_bank_name, seller_account_no, seller_real_name)
 
-     # Store order details FIRST (before any early returns)
-     self._store_order_details(order_id, amount_naira, seller_bank_name, seller_account_no, seller_real_name)
-
-     latest = self._latest_order_result(order_id)
-     if not self._is_payable_status(latest):
+       latest = self._latest_order_result(order_id)
+       if not self._is_payable_status(latest):
         self._handle_transfer_failure(
             order_id,
             "Order no longer payable (appeal/paid/completed/cancelled/unknown).",
             log_level='warning'
         )
+        return False
+     except Exception as e:
+        logger.error(f"Error checking order status for {order_id}: {e}")
+        self._handle_transfer_failure(order_id, f"Error validating order: {e}", log_level='error')
         return False
 
     
@@ -1240,6 +1475,10 @@ class P2PBotService:
      amount_naira = self._round_amount(order_id, amount_naira)
      if amount_naira is False:  # rounding failed badly
       return False
+
+     # Deduct service fee before transfer
+     amount_naira = amount_naira - 50
+     logger.info(f"Deducted 50 NGN service fee for order {order_id}. Transfer amount: {amount_naira} NGN")
      
      
      if not USE_NOMBA_FOR_TRANSFERS:
@@ -1302,8 +1541,15 @@ class P2PBotService:
                  )
                  return False
      
-     current_balance = self.nomba_api.get_wallet_balance()
-     logger.info(f"Nomba balance for {order_id}: {current_balance:.2f} NGN")
+     # Check the correct account's balance (sub-account if enabled, else main account)
+     _use_sub = redis_client.get('p2p_bot:use_sub_account')
+     _sub_id  = redis_client.get('p2p_bot:sub_account_id') or os.getenv('NOMBA_SUB_ACCOUNT_ID', '')
+     if _use_sub == 'true' and _sub_id:
+         current_balance = self.nomba_api.get_sub_account_balance(_sub_id)
+         logger.info(f"Nomba sub-account ({_sub_id}) balance for {order_id}: {current_balance:.2f} NGN")
+     else:
+         current_balance = self.nomba_api.get_wallet_balance()
+         logger.info(f"Nomba main account balance for {order_id}: {current_balance:.2f} NGN")
      if current_balance == 0.0 or current_balance < amount_naira:
          logger.warning(f"Insufficient balance {current_balance:.2f} NGN for {amount_naira:.2f} NGN on {order_id}")
          self._handle_transfer_failure(order_id, f"Low balance for {order_id}", log_level='warning')
@@ -1401,12 +1647,13 @@ class P2PBotService:
         return False
      transfer_status_code = transfer_response.get('code')
      transfer_description = transfer_response.get('description', 'No description')
+     transfer_data_status = (transfer_response.get('data') or {}).get('status', '')
 
-     
+
 
     # Handle different response codes properly
-     if transfer_status_code == '00':
-            # Completed immediately
+     if transfer_status_code == '00' or transfer_data_status == 'SUCCESS':
+            # Completed immediately (v1 code='00' OR v2 data.status='SUCCESS')
             logger.info(f"✅ Nomba transfer completed immediately for {order_id}")
             transfer_successful = True
             transfer_details= {"bybit_order_id": order_id,"nomba_transaction_reference": nomba_merchant_tx_ref,
@@ -1417,6 +1664,17 @@ class P2PBotService:
                                "nomba_status_code": transfer_status_code,
                                "timestamp_initiated": time.time(),
                                "status_details": transfer_description}
+
+     elif transfer_data_status in ('PENDING_BILLING', 'NEW'):
+        # v2 pending — do not retry, wait for webhook or recovery loop
+        logger.info(f"⏳ Transfer for {order_id} is pending (status={transfer_data_status}). Waiting for webhook or recovery.")
+        return True
+
+     elif transfer_data_status == 'REFUND':
+        # v2 refund — mark as failed
+        logger.error(f"❌ Transfer for {order_id} was refunded (status=REFUND).")
+        self._handle_transfer_failure(order_id, f"Transfer refunded for {order_id}", log_level='error')
+        return False
 
      elif transfer_status_code == '202':
         # Poll for status until success or timeout
@@ -1458,27 +1716,17 @@ class P2PBotService:
                     logger.warning(f"⏳ {order_id} still processing, attempt {attempt + 1}: {status_response}")
             except AttributeError as e:
                 logger.error(f"No check_transfer_status method available for {order_id}: {e}")
-                self._handle_transfer_failure(
-                    order_id,
-                    f"Status check attribute error: {e}",
-                    log_level='error'
-                )
                 break
             except Exception as e:
                 logger.error(f"Error checking status for {order_id} on attempt {attempt + 1}: {e}")
-                if attempt == max_checks - 1:
-                    # Last attempt failed
-                    self._handle_transfer_failure(
-                        order_id,
-                        f"Status check failed after {max_checks} attempts: {e}",
-                        log_level='error'
-                    )
                 continue
         # If we couldn't confirm status but initiated successfully, assume success
+              # If we couldn't confirm status but initiated successfully, assume success
         if not transfer_successful:
-            logger.warning(f"⚠️ Could not confirm status for {order_id} but transfer was initiated. Assuming success.")
-            transfer_successful = True  # Since money was debited
-            transfer_details = {
+            logger.warning(f"Transfer for {order_id} still pending confirmation. Waiting for webhook or next status check.")
+            return True  # Exit here; the webhook or next scheduled check will handle confirmation when status updates
+        
+        transfer_details = {
                 "bybit_order_id": order_id,
                 "nomba_transaction_reference": nomba_merchant_tx_ref,
                 "amount_naira": amount_naira,
@@ -1489,32 +1737,7 @@ class P2PBotService:
                 "timestamp_initiated": time.time(),
                 "status_details": "Assumed success after unconfirmed status"
             }
-            # Alert Telegram about unconfirmed transfer
-            tg = getattr(self, "telegram_bot", None)
-            if tg:
-                try:
-                    _safe_fire_and_forget(
-                        tg.notify(
-                            f"⚠️ UNCONFIRMED TRANSFER\n"
-                            f"Order: {order_id}\n"
-                            f"Amount: {amount_naira} NGN\n"
-                            f"Bank: {seller_bank_name}\n"
-                            f"Account: {seller_account_no}\n"
-                            f"Status checks inconclusive. Transfer may have gone through.\n"
-                            f"Monitor manually and confirm receipt."
-                        )
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send unconfirmed transfer alert to Telegram for {order_id}: {e}")
-     else:
-        # Unexpected status code (not 00, not 202)
-        logger.error(f"❌ Unexpected Nomba response code {transfer_status_code} for {order_id}: {transfer_description}")
-        self._handle_transfer_failure(
-            order_id,
-            f"Unexpected transfer response: {transfer_status_code} - {transfer_description}",
-            log_level='error'
-        )
-        return False
+       
             
          
         # ...after transfer_successful is set to True...
@@ -1569,6 +1792,7 @@ class P2PBotService:
          return False
      if self.redis_client:
          self.redis_client.delete(lock_key)
+     
 
      
     def _is_payable_status(self, order_result: dict) -> bool:
@@ -1629,51 +1853,118 @@ class P2PBotService:
 
 
      
-
     def _pick_bybit_payment_term(self, order_result, seller_account_no):
      payment_terms = order_result.get("paymentTermList", [])
      seller_norm = normalize_account_number(seller_account_no)
+
+     if not payment_terms:
+        return None, None, "No payment terms available"
+
+    # --- 1. STRICT MATCH (BEST CASE) ---
      for term in payment_terms:
         acc = normalize_account_number(term.get("accountNo", ""))
+
+        payment_type = term.get("paymentType")
+        payment_id = term.get("id")
+
+        if not payment_type or not payment_id:
+            continue  # skip broken terms
+
         if acc and acc == seller_norm:
-            return term.get("paymentType"), term.get("id"), "Matched by normalized account number"
-    # Fallback as you had
-     if payment_terms:
-        term = payment_terms[0]
-        return term.get("paymentType"), term.get("id"), "Defaulted to first payment term"
-     return None, None, "No payment term found"
+            logger.info(f"✅ Matched payment term by account: {term}")
+            return payment_type, payment_id, "Matched by account number"
+
+    # --- 2. SAFE FALLBACK (NOT BLIND) ---
+     for term in payment_terms:
+        payment_type = term.get("paymentType")
+        payment_id = term.get("id")
+
+        if payment_type and payment_id:
+            logger.warning(f"⚠️ Fallback to first valid term: {term}")
+            return payment_type, payment_id, "Fallback to first valid term"
+
+    # --- 3. NOTHING USABLE ---
+     return None, None, "No valid payment term found"
 
     
     def retry_failed_order(self, order_id, bank, account, name):
-        logger.info(f"Retrying failed order {order_id} with updated details.")
-        # Load original amount from Redis
-        amount_naira = self._rget(f'p2p_bot:order_details:{order_id}', 'amount')
+     logger.info(f"🔁 Retrying failed order {order_id}")
+
+    # =========================
+    # 📊 TRACK ATTEMPT
+    # =========================
+     if self.redis_client:
         try:
-            amount_naira = float(amount_naira)
-        except Exception:
-            amount_naira = None
-        self._execute_transfer(order_id, amount_naira,
-                              seller_bank_name=bank,
-                              seller_account_no=account,
-                              seller_real_name=name)
-    def get_success_rate(self):
-        if not self.redis_client:
-            return {"success_rate": None, "message": "Redis not connected."}
-        total_attempted = (
-            self.redis_client.scard("p2p_bot:processed_orders") +
-            self.redis_client.scard("p2p_bot:stuck_orders") +
-            self.redis_client.scard("p2p_bot:insufficient_funds_orders")
+            self.redis_client.incr("p2p_bot:total_attempted")
+        except Exception as e:
+            logger.warning(f"Failed to increment total_attempted: {e}")
+
+    # =========================
+    # 🔒 INPUT VALIDATION
+    # =========================
+     if not account or not account.isdigit() or len(account) != 10:
+        logger.error(f"❌ Invalid account number: {account}")
+        self._track_failure(order_id, "Invalid account number")
+        return
+
+     if not bank or len(bank.strip()) < 2:
+        logger.error(f"❌ Invalid bank: {bank}")
+        self._track_failure(order_id, "Invalid bank")
+        return
+
+     if not name or len(name.strip()) < 3:
+        logger.error(f"❌ Invalid account name: {name}")
+        self._track_failure(order_id, "Invalid account name")
+        return
+
+    # =========================
+    # 💰 FETCH AMOUNT FROM API
+    # =========================
+     try:
+        details = self.bybit_api.get_order_details(order_id)
+
+        if not details or details.get("ret_code") != 0:
+            raise ValueError("Bybit fetch failed")
+
+        result = details.get("result", {})
+        amount_naira = float(result.get("amount", 0))
+
+     except Exception as e:
+        logger.error(f"❌ Amount fetch failed for {order_id}: {e}")
+        self._track_failure(order_id, "Amount fetch failed")
+        return
+
+     if amount_naira <= 0:
+        logger.error(f"❌ Invalid amount for {order_id}")
+        self._track_failure(order_id, "Invalid amount")
+        return
+
+    # =========================
+    # 🚀 EXECUTE TRANSFER
+    # =========================
+     try:
+        self._execute_transfer(
+            order_id,
+            amount_naira,
+            seller_bank_name=bank.strip(),
+            seller_account_no=account.strip(),
+            seller_real_name=name.strip()
         )
-        successful = self.redis_client.scard("p2p_bot:processed_orders")
-        if total_attempted == 0:
-            rate = 0.0
-        else:
-            rate = successful / total_attempted * 100
-        return {
-            "success_rate": round(rate, 2),
-            "successful": successful,
-            "total_attempted": total_attempted
-        }
+
+        logger.info(f"✅ Transfer executed for {order_id}")
+
+        # =========================
+        # 📊 TRACK SUCCESS
+        # =========================
+        if self.redis_client:
+            try:
+                self.redis_client.incr("p2p_bot:successful")
+            except Exception as e:
+                logger.warning(f"Failed to increment successful: {e}")
+
+     except Exception as e:
+        logger.error(f"❌ Transfer failed for {order_id}: {e}")
+        self._track_failure(order_id, str(e))
     
     def _round_amount(self, order_id, amount_naira):
      try:
@@ -1700,7 +1991,21 @@ class P2PBotService:
 
                 
 
-                        
+    def start_background_jobs(app, bot_service):
+     scheduler = APScheduler()
+     scheduler.init_app(app)
+
+     scheduler.add_job(
+        id="nomba_recovery_loop",
+        func=bot_service.recover_and_confirm_orders,
+        trigger="interval",
+        seconds=10,  # aggressive but safe
+        max_instances=1,
+        replace_existing=True
+    )
+
+     scheduler.start()
+     app.apscheduler = scheduler                  
                     
 
 
@@ -1786,58 +2091,19 @@ class P2PBotService:
                     self._handle_transfer_failure(order_id, f"No order details found for order {order_id}. Skipping.")
                     continue
 
+                # Extract seller details robustly using your fallback function
+               # Extract seller details from order_details before using them
+                
+
+                 
+
                 # FIX: Update amount_naira from detailed order info
                 amount_naira = float(order_details.get('amount') or 0)
 
-                # Store amount early so if extraction fails, Telegram gets the order amount
-                if self.redis_client:
-                    self.redis_client.hset(f'p2p_bot:order_details:{order_id}', 'amount', str(amount_naira))
+                seller_bank_name, seller_account_no, seller_real_name = self._extract_payment_details(order_details, order_id)
 
-                # Extract seller details robustly using your fallback function
-                try:
-                    seller_bank_name, seller_account_no, seller_real_name = self._extract_payment_details(order_details, order_id)
-                except Exception as extract_error:
-                    logger.error(f"Extraction exception for {order_id}: {extract_error}")
-                    self._handle_transfer_failure(
-                        order_id,
-                        f"Payment details extraction crashed: {extract_error}",
-                        log_level='error'
-                    )
-                    continue
 
                 if not all([seller_bank_name, seller_account_no, seller_real_name]):
-                    # Extraction returned None - notify admin to fix manually
-                    logger.warning(f"Extraction incomplete for {order_id}. Requesting admin intervention.")
-                    self.redis_client.sadd("p2p_bot:extraction_failed_orders", order_id)
-                    self.redis_client.hset(f'p2p_bot:order_details:{order_id}', mapping={
-                        'bank': seller_bank_name or 'EXTRACTION_FAILED',
-                        'account': seller_account_no or 'EXTRACTION_FAILED',
-                        'name': seller_real_name or 'EXTRACTION_FAILED',
-                        'amount': str(amount_naira),
-                        'timestamp': str(time.time())
-                    })
-                    # Send Telegram notification asking admin to fix
-                    tg = getattr(self, "telegram_bot", None)
-                    if tg:
-                        try:
-                            error_details = {
-                                'order_id': order_id,
-                                'reason': 'Standard extraction + AI fallback both failed',
-                                'amount': amount_naira,
-                                'seller_bank_name': seller_bank_name or 'UNKNOWN',
-                                'seller_account_no': seller_account_no or 'UNKNOWN',
-                                'seller_real_name': seller_real_name or 'UNKNOWN'
-                            }
-                            _safe_fire_and_forget(
-                                tg.send_stuck_order_notification(
-                                    order_id,
-                                    "Payment details extraction failed (standard + AI). Please provide correct details.",
-                                    error_details
-                                )
-                            )
-                            logger.info(f"Sent manual review request to Telegram for {order_id}")
-                        except Exception as tg_error:
-                            logger.error(f"Failed to send extraction failure alert to Telegram for {order_id}: {tg_error}")
                     continue  # skip if details not valid
 
 
@@ -1879,37 +2145,82 @@ class P2PBotService:
                 self.redis_client.delete(lock_key)
                 logger.debug("Released processing lock.")
 
-    def check_pending_nomba_transfers(self):
-        pending_orders = list(self.redis_client.smembers("p2p_bot:pending_transfers"))
-        for order_id in pending_orders:
-            nomba_merchant_tx_ref = self.redis_client.hget("p2p_bot:pending_nomba_refs", order_id)
-            if not nomba_merchant_tx_ref:
-                logger.error(f"No merchant_tx_ref found for pending order {order_id}. Skipping status check.")
-                continue
-            status_resp = self.nomba_api._send_request(
-                "GET",
-                f"/v1/transfers/bank/{nomba_merchant_tx_ref}",
-                requires_auth=True
-            )
-            code = status_resp.get("code")
-            desc = status_resp.get("description", "")
-            if code == "00":
-                logger.info(f"Nomba transfer for order {order_id} now successful. Marking as processed.")
-                self.redis_client.srem("p2p_bot:pending_transfers", order_id)
-                self.redis_client.hdel("p2p_bot:pending_nomba_refs", order_id)
-                self.redis_client.sadd("p2p_bot:processed_orders", order_id)
-                confirm_resp = self.bybit_api.confirm_p2p_order_paid(order_id)
-                if confirm_resp.get("retCode") == 0:
-                    logger.info(f"Confirmed order {order_id} as paid on Bybit after pending transfer.")
+    def recover_and_confirm_orders(self):
+     try:
+        orders = self.redis_client.smembers("p2p_bot:pending_transfers")
+
+        if not orders:
+            return
+
+        for order_id in orders:
+            try:
+                logger.info(f"🔁 Attempting to mark {order_id} as paid on Bybit")
+
+                ref  = self.redis_client.hget("p2p_bot:pending_nomba_refs", order_id)
+                acct = self.redis_client.hget(f"p2p_bot:order_details:{order_id}", "account")
+
+                # ── CHECK BYBIT STATUS FIRST ─────────────────────────
+                details = self.bybit_api.get_order_details(order_id)
+                if not details or details.get("ret_code", details.get("retCode")) != 0:
+                    logger.warning(f"⚠️ Could not fetch Bybit details for {order_id}, retrying next cycle")
+                    continue
+
+                bybit_status = details.get("result", {}).get("status")
+                logger.info(f"🔍 Bybit status for {order_id}: {bybit_status}")
+
+                # ── ALREADY PAID → JUST CLEAN UP ─────────────────────
+                if bybit_status in [1, 2]:
+                    logger.info(f"✅ {order_id} already paid on Bybit — cleaning up")
+                    self._finalize_success(order_id, ref, {
+                        "bybit_order_id": order_id,
+                        "nomba_transaction_reference": ref,
+                        "status_details": "Already paid on Bybit"
+                    })
+                    continue
+
+                # ── NOT PAID → MARK IT NOW ───────────────────────────
+                result = details.get("result", {})
+                payment_type, payment_id, reason = self._pick_bybit_payment_term(result, acct)
+
+                if not payment_type or not payment_id:
+                    logger.error(f"❌ No payment term for {order_id}: {reason}")
+                    continue
+
+                confirm = self.bybit_api.confirm_p2p_order_paid(
+                    order_id, payment_type, payment_id
+                )
+                ret_code = confirm.get("retCode", confirm.get("ret_code"))
+                ret_msg  = confirm.get("retMsg",  confirm.get("ret_msg", ""))
+
+                if ret_code == 0:
+                    logger.info(f"✅ Marked {order_id} as paid on Bybit")
+                    self._finalize_success(order_id, ref, {
+                        "bybit_order_id": order_id,
+                        "nomba_transaction_reference": ref,
+                        "status_details": "Marked paid via recovery loop"
+                    })
                 else:
-                    logger.error(f"Failed to confirm order {order_id} as paid on Bybit after pending transfer: {confirm_resp.get('retMsg')}")
-            elif code not in ("202", "00"):
-                logger.error(f"Nomba transfer for order {order_id} failed or unknown status ({code}: {desc}). Marking as stuck.")
-                self.redis_client.srem("p2p_bot:pending_transfers", order_id)
-                self.redis_client.hdel("p2p_bot:pending_nomba_refs", order_id)
-                self.redis_client.sadd("p2p_bot:stuck_orders", order_id)
-            else:
-                logger.info(f"Nomba transfer for order {order_id} still processing ({code}: {desc}). Will check again next cycle.")
+                    logger.warning(f"⚠️ Bybit confirm failed for {order_id}: {ret_msg} — retrying next cycle")
+
+                # ── HARD ESCALATION ──────────────────────────────────
+                attempts = self.redis_client.hincrby("p2p_bot:confirm_attempts", order_id, 1)
+                if attempts > 20:
+                    logger.critical(f"🚨 {order_id} STUCK after {attempts} attempts")
+                    self.redis_client.sadd("p2p_bot:stuck_orders", order_id)
+                    self.redis_client.srem("p2p_bot:pending_transfers", order_id)
+                    self.redis_client.hdel("p2p_bot:confirm_attempts", order_id)
+                    self._handle_transfer_failure(
+                        order_id,
+                        f"Could not confirm {order_id} on Bybit after {attempts} attempts",
+                        log_level='critical'
+                    )
+
+            except Exception as e:
+                logger.error(f"💥 Error processing {order_id}: {e}")
+                continue
+
+     except Exception as e:
+        logger.critical(f"💥 Recovery loop crashed: {e}")
 
     def _finalize_success(self, order_id, nomba_merchant_tx_ref, transfer_details):
       try:
@@ -1944,6 +2255,12 @@ class P2PBotService:
 bybit_api = BybitP2PClient(BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_BASE_URL)
 nomba_api = NombaAPI(NOMBA_CLIENT_ID, NOMBA_CLIENT_SECRET, NOMBA_ACCOUNT_ID, NOMBA_BASE_URL, NOMBA_SENDER_NAME)
 p2p_bot_service = P2PBotService(bybit_api, nomba_api, redis_client)
+# START TELEGRAM BOT
+from telegram_runner import TelegramBot
+
+
+
+
 # Start APScheduler immediately at boot so the bot runs even with no incoming HTTP traffic
 
 scheduler_initialized = False
@@ -1967,6 +2284,16 @@ def initialize_scheduler_once():
                     seconds=POLLING_INTERVAL_SECONDS
                 )
                 logger.info(f"Scheduler job 'process_p2p_orders_job' added with interval {POLLING_INTERVAL_SECONDS} seconds.")
+            if not scheduler.get_job('recover_and_confirm_job'):
+                 scheduler.add_job(
+                 id='recover_and_confirm_job',
+                 func=p2p_bot_service.recover_and_confirm_orders,
+                 trigger='interval',
+                 seconds=5,          # runs every 5 seconds
+                 max_instances=1,    # prevents overlap if it takes longer than 5s
+                 replace_existing=True
+                )
+                 logger.info("Scheduler job 'recover_and_confirm_job' added with 5-second interval.")
 
             if redis_client:
                 if not scheduler.running:
@@ -2067,6 +2394,14 @@ BANK_CODES = {
     "flexi": "090835",
     "flutterwave": "622",
     "gtbank": "058",
+    "gtb": "058",
+    "guaranty trust bank": "058",
+    "guaranty trust": "058",
+    "guaranty trust bank plc": "058",
+    "gtbank plc": "058",
+    "gt bank": "058",
+    "gt bank plc": "058",
+    "guaranty trust bk": "058",
     "globus": "000027",
     "goldman": "090574",
     "goodnews": "090495",
@@ -2264,6 +2599,7 @@ def resolve_bank_code(user_input, bank_code_dict, threshold=0.8):
 
 # --- Flask Routes (No changes to existing routes) ---
 
+
         
 @app.route('/webhook/nomba/transfer', methods=['POST'])
 def nomba_transfer_webhook():
@@ -2381,3 +2717,290 @@ def control_status():
 def control_success_rate():
     data = p2p_bot_service.get_success_rate()
     return jsonify({"ok": True, **data}), 200
+
+
+# ─── DASHBOARD API ROUTES ────────────────────────────────────────────────────
+
+@app.route('/api/status', methods=['GET'])
+def api_status():
+    """Bot status for the dashboard."""
+    return jsonify(p2p_bot_service.get_bot_status()), 200
+
+
+@app.route('/api/orders/pending', methods=['GET'])
+def api_orders_pending():
+    """
+    Fetch live pending orders from Bybit, enriched with Redis state flags.
+    Each order includes real seller bank details and the current NGN/USDT rate.
+    """
+    try:
+        raw_orders = p2p_bot_service.bybit_api.get_pending_orders()
+    except Exception as e:
+        logger.error(f"Failed to fetch pending orders: {e}")
+        return jsonify({"data": [], "message": str(e)}), 200
+
+    if not raw_orders:
+        return jsonify({"data": [], "message": "No pending orders or Bybit API error."}), 200
+
+    enriched = []
+    rc = p2p_bot_service.redis_client
+
+    for o in raw_orders:
+        oid = o.get("orderId") or o.get("id", "")
+        if not oid:
+            continue
+
+        # Redis state flags
+        is_processed  = bool(rc and rc.sismember("p2p_bot:processed_orders", oid))
+        is_stuck       = bool(rc and rc.sismember("p2p_bot:stuck_orders", oid))
+        is_insuf       = bool(rc and rc.sismember("p2p_bot:insufficient_funds_orders", oid))
+        is_cancelled   = bool(rc and rc.sismember("p2p_bot:cancelled_by_user_orders", oid))
+
+        # Check for user-overridden bank details saved via /api/orders/update
+        stored = {}
+        if rc:
+            stored = rc.hgetall(f"p2p_bot:order_details:{oid}") or {}
+
+        seller = o.get("sellerInfo", {})
+        enriched.append({
+            "orderId":           oid,
+            "fiatAmount":        o.get("fiatAmount", 0),
+            "usdtAmount":        o.get("usdtAmount", 0),
+            "unitPrice":         o.get("unitPrice", 0),
+            "status":            o.get("status", "unknown"),
+            "createdAt":         o.get("createdAt", 0),
+            "sellerInfo": {
+                "bankName":          stored.get("bank_name")    or seller.get("bankName", "N/A"),
+                "bankAccountNo":     stored.get("account_no")   or seller.get("bankAccountNo", "N/A"),
+                "accountHolderName": stored.get("seller_name")  or seller.get("accountHolderName", "N/A"),
+            },
+            "isProcessed":       is_processed,
+            "isStuck":           is_stuck,
+            "isInsufficientFunds": is_insuf,
+            "isCancelledByUser": is_cancelled,
+        })
+
+    return jsonify({"data": enriched, "message": "ok"}), 200
+
+
+@app.route('/api/transfers', methods=['GET'])
+def api_transfers():
+    """Full transfer history from Redis."""
+    data = p2p_bot_service.get_transfer_history_data()
+    return jsonify(data), 200
+
+
+@app.route('/api/success-rate', methods=['GET'])
+def api_success_rate():
+    """
+    Real success rate computed from Redis sets and transfer history.
+    """
+    rc = p2p_bot_service.redis_client
+    if not rc:
+        return jsonify({"ok": False, "message": "Redis not connected"}), 200
+
+    processed_ids = rc.smembers("p2p_bot:processed_orders") or set()
+    failed_ids    = rc.smembers("p2p_bot:failed_orders")    or set()
+    pending_ids   = rc.smembers("p2p_bot:pending_transfers") or set()
+
+    total_done   = len(processed_ids) + len(failed_ids)
+    rate         = round(len(processed_ids) / total_done * 100, 1) if total_done > 0 else 0.0
+
+    # volume from transfer history
+    transfers_raw = rc.lrange("p2p_bot:transfers", 0, -1) or []
+    transfers = []
+    volume = 0.0
+    durations = []
+    for t in transfers_raw:
+        try:
+            obj = json.loads(t)
+            transfers.append(obj)
+            volume += float(obj.get("amount_naira", 0))
+            if obj.get("duration_seconds"):
+                durations.append(float(obj["duration_seconds"]))
+        except Exception:
+            pass
+
+    avg_duration = round(sum(durations) / len(durations), 1) if durations else None
+
+    # last 14 days — volume per day
+    from collections import defaultdict
+    daily = defaultdict(float)
+    now_ts = time.time()
+    for obj in transfers:
+        ts = obj.get("timestamp_initiated") or obj.get("timestamp", 0)
+        try:
+            ts = float(ts)
+        except Exception:
+            continue
+        days_ago = int((now_ts - ts) / 86400)
+        if days_ago <= 13:
+            label = datetime.utcfromtimestamp(ts).strftime("%d %b")
+            daily[label] += float(obj.get("amount_naira", 0))
+
+    return jsonify({
+        "ok": True,
+        "successRate":    rate,
+        "successful":     len(processed_ids),
+        "failed":         len(failed_ids),
+        "pending":        len(pending_ids),
+        "totalDone":      total_done,
+        "volumeNaira":    round(volume, 2),
+        "avgDurationSec": avg_duration,
+        "dailyVolume":    dict(daily),
+        "recentTransfers": transfers[-10:][::-1],
+    }), 200
+
+
+@app.route('/api/orders/update/<order_id>', methods=['POST'])
+def api_order_update(order_id):
+    """
+    Save user-edited bank details for an order to Redis.
+    Body: { bankName, bankAccountNo, accountHolderName }
+    """
+    body = request.get_json(silent=True) or {}
+    rc = p2p_bot_service.redis_client
+    if not rc:
+        return jsonify({"ok": False, "message": "Redis not connected"}), 200
+
+    mapping = {}
+    if body.get("bankName"):          mapping["bank_name"]   = body["bankName"]
+    if body.get("bankAccountNo"):     mapping["account_no"]  = body["bankAccountNo"]
+    if body.get("accountHolderName"): mapping["seller_name"] = body["accountHolderName"]
+
+    if mapping:
+        rc.hset(f"p2p_bot:order_details:{order_id}", mapping=mapping)
+        rc.expire(f"p2p_bot:order_details:{order_id}", 86400)
+
+    logger.info(f"Updated order details for {order_id}: {mapping}")
+    return jsonify({"ok": True, "message": "Order details saved."}), 200
+
+
+@app.route('/api/orders/retry/<order_id>', methods=['POST'])
+def api_order_retry(order_id):
+    """
+    Trigger _execute_transfer for the given order using stored/edited details.
+    After a successful transfer the order is removed from pending (marked processed).
+    """
+    rc = p2p_bot_service.redis_client
+    if not rc:
+        return jsonify({"ok": False, "message": "Redis not connected"}), 200
+
+    # Get stored details (may have been updated by /api/orders/update)
+    stored = rc.hgetall(f"p2p_bot:order_details:{order_id}") or {}
+
+    # If not stored yet, fetch from Bybit now
+    if not stored.get("bank_name") or not stored.get("account_no"):
+        details_resp = p2p_bot_service.bybit_api.get_order_details(order_id)
+        if details_resp and details_resp.get("ret_code") == 0:
+            result = details_resp.get("result", {})
+            pt_list = result.get("paymentTermList") or result.get("paymentList") or []
+            if pt_list:
+                pt = pt_list[0]
+                stored["bank_name"]   = pt.get("bankName") or pt.get("bankBranchName", "")
+                stored["account_no"]  = pt.get("accountNo") or pt.get("bankAccount", "")
+                stored["seller_name"] = get_best_seller_name(result)
+                stored["amount"]      = str(result.get("amount") or result.get("notifyTokenQuantity", "0"))
+
+    amount_naira   = float(stored.get("amount", 0))
+    bank_name      = stored.get("bank_name", "")
+    account_no     = stored.get("account_no", "")
+    seller_name    = stored.get("seller_name", "")
+
+    if not amount_naira or not bank_name or not account_no:
+        return jsonify({"ok": False, "message": "Incomplete order details. Please edit and save first."}), 200
+
+    # Clear stuck/failed flags so the transfer can proceed
+    for key in ("p2p_bot:stuck_orders", "p2p_bot:failed_orders",
+                "p2p_bot:insufficient_funds_orders"):
+        rc.srem(key, order_id)
+
+    def _run():
+        try:
+            p2p_bot_service._execute_transfer(
+                order_id, amount_naira, bank_name, account_no, seller_name
+            )
+        except Exception as ex:
+            logger.error(f"Retry transfer failed for {order_id}: {ex}")
+
+    Thread(target=_run, daemon=True).start()
+
+    return jsonify({"ok": True, "message": f"Transfer initiated for order {order_id}."}), 200
+
+
+@app.route('/api/config/sub-account', methods=['GET'])
+def api_config_get_sub_account():
+    rc = p2p_bot_service.redis_client
+    if not rc:
+        return jsonify({"ok": False, "message": "Redis not connected"}), 200
+    redis_val = rc.get('p2p_bot:sub_account_id')
+    if redis_val:
+        return jsonify({"ok": True, "subAccountId": redis_val, "source": "redis"}), 200
+    return jsonify({"ok": True, "subAccountId": NOMBA_SUB_ACCOUNT_ID, "source": "env"}), 200
+
+
+@app.route('/api/config/sub-account', methods=['POST'])
+def api_config_set_sub_account():
+    rc = p2p_bot_service.redis_client
+    if not rc:
+        return jsonify({"ok": False, "message": "Redis not connected"}), 200
+    body = request.get_json(silent=True) or {}
+    sub_account_id = body.get('subAccountId', '').strip()
+    if not sub_account_id:
+        return jsonify({"ok": False, "message": "subAccountId is required"}), 200
+
+    # Try to fetch details — but don't block if the details API returns nothing
+    details = nomba_api.get_sub_account_details(sub_account_id=sub_account_id)
+    account_status = (details.get("status", "") if details else "").upper()
+
+    # Only hard-reject if status is explicitly bad
+    blocked_statuses = {"SUSPENDED", "BLACKLISTED", "INACTIVE", "PND"}
+    if account_status in blocked_statuses:
+        return jsonify({
+            "ok": False,
+            "message": f"Sub-account is {account_status}. Cannot use it for transfers."
+        }), 200
+
+    # Save — status empty/unknown is allowed (details API may not always return it)
+    rc.set('p2p_bot:sub_account_id', sub_account_id)
+    logger.info(f"Sub-account ID set to: {sub_account_id} (status={account_status or 'unknown'})")
+    return jsonify({
+        "ok": True,
+        "subAccountId": sub_account_id,
+        "accountName": details.get("accountName") if details else "N/A",
+        "status": account_status or "unknown",
+        "banks": details.get("banks", []) if details else []
+    }), 200
+
+
+@app.route('/api/config/sub-account', methods=['DELETE'])
+def api_config_delete_sub_account():
+    rc = p2p_bot_service.redis_client
+    if not rc:
+        return jsonify({"ok": False, "message": "Redis not connected"}), 200
+    rc.delete('p2p_bot:sub_account_id')
+    logger.info("Sub-account ID deleted from Redis; will fall back to .env")
+    return jsonify({"ok": True, "message": "Sub-account ID removed from Redis. Falling back to .env value."}), 200
+
+
+@app.route('/api/config/use-sub-account', methods=['GET'])
+def api_config_get_use_sub_account():
+    rc = p2p_bot_service.redis_client
+    if not rc:
+        return jsonify({"ok": False, "message": "Redis not connected"}), 200
+    val = rc.get('p2p_bot:use_sub_account')
+    return jsonify({"ok": True, "useSubAccount": val == 'true'}), 200
+
+
+@app.route('/api/config/use-sub-account', methods=['POST'])
+def api_config_set_use_sub_account():
+    rc = p2p_bot_service.redis_client
+    if not rc:
+        return jsonify({"ok": False, "message": "Redis not connected"}), 200
+    body = request.get_json(silent=True) or {}
+    if 'enabled' not in body:
+        return jsonify({"ok": False, "message": "enabled field is required"}), 200
+    enabled = bool(body['enabled'])
+    rc.set('p2p_bot:use_sub_account', 'true' if enabled else 'false')
+    logger.info(f"use_sub_account set to: {enabled}")
+    return jsonify({"ok": True, "useSubAccount": enabled}), 200
